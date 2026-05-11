@@ -68,3 +68,15 @@ async def add_configs_bulk(session: AsyncSession, category_id: int, configs: lis
     session.add_all([ConfigAvailable(category_id=category_id, config_text=x) for x in clean])
     await session.commit()
     return len(clean)
+
+
+async def clear_inventory_by_category(session: AsyncSession, category_id: int) -> int:
+    result = await session.execute(delete(ConfigAvailable).where(ConfigAvailable.category_id == category_id))
+    await session.commit()
+    return result.rowcount or 0
+
+
+async def clear_inventory_all(session: AsyncSession) -> int:
+    result = await session.execute(delete(ConfigAvailable))
+    await session.commit()
+    return result.rowcount or 0

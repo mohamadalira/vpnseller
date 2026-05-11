@@ -8,7 +8,10 @@ def admin_menu() -> ReplyKeyboardMarkup:
         ["📊 آمار فروش", "📄 کانفیگ‌های فروخته شده"],
         ["📤 خروجی اکسل فروش", "📢 ارسال پیام همگانی"],
         ["📥 پرداخت‌های در انتظار", "📡 مدیریت کانال‌های اجباری"],
-        ["👤 مدیریت ادمین‌ها"],
+        ["👤 مدیریت ادمین‌ها", "🗂 مدیریت موجودی"],
+        ["📝 مدیریت پیام‌ها"],
+        ["💸 مدیریت روش‌های پرداخت", "💼 کیف پول کاربران"],
+        ["🧾 تراکنش‌ها", "👥 آمار زیرمجموعه‌ها"],
     ]
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t) for t in row] for row in items],
@@ -84,5 +87,47 @@ def card_manage_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📋 مشاهده شماره کارت فعلی", callback_data="card:view")],
             [InlineKeyboardButton(text="✏️ تغییر شماره کارت", callback_data="card:number")],
             [InlineKeyboardButton(text="✏️ تغییر نام صاحب کارت", callback_data="card:holder")],
+        ]
+    )
+
+
+def inventory_manage_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 نمایش موجودی دسته بندی ها", callback_data="inv:stats")],
+            [InlineKeyboardButton(text="🧹 پاکسازی یک دسته بندی", callback_data="inv:clear_cat")],
+            [InlineKeyboardButton(text="🔥 پاکسازی کامل مخزن", callback_data="inv:clear_all")],
+        ]
+    )
+
+
+def confirm_clear_all_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚠️ بله، همه حذف شود", callback_data="invall:yes")],
+            [InlineKeyboardButton(text="❌ انصراف", callback_data="invall:no")],
+        ]
+    )
+
+
+def messages_manage_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📋 مشاهده پیام ها", callback_data="msg:list")],
+            [InlineKeyboardButton(text="✏️ ویرایش پیام", callback_data="msg:edit")],
+        ]
+    )
+
+
+def payment_methods_manage_kb(rows: list[tuple[str, bool]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"{'✅' if is_active else '❌'} {name}",
+                    callback_data=f"pm:toggle:{name}",
+                )
+            ]
+            for name, is_active in rows
         ]
     )

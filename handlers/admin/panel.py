@@ -1,11 +1,11 @@
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
+from handlers.admin.states import AdminState
 from keyboards.admin_kb import (
     admin_menu,
     admins_manage_kb,
@@ -13,9 +13,13 @@ from keyboards.admin_kb import (
     category_manage_kb,
     category_select_kb,
     channels_manage_kb,
+    confirm_clear_all_kb,
     confirm_delete_kb,
+    inventory_manage_kb,
+    messages_manage_kb,
+    payment_methods_manage_kb,
 )
-from models import Admin, AppSetting, Category, ConfigAvailable, ConfigSold, Order, Payment, RequiredChannel, User
+from models import Admin, AppSetting, Category, ConfigAvailable, ConfigSold, Order, Payment, Referral, RequiredChannel, Transaction, User
 from services.admin_service import (
     add_admin,
     create_category,
@@ -27,35 +31,21 @@ from services.admin_service import (
     update_category_name,
     update_category_price,
 )
-from services.config_service import add_configs_bulk, category_with_counts, inventory_stats
+from services.config_service import (
+    add_configs_bulk,
+    category_with_counts,
+    clear_inventory_all,
+    clear_inventory_by_category,
+    inventory_stats,
+)
 from services.export_service import export_sold_to_excel, export_sold_to_txt
+from services.message_service import DEFAULT_MESSAGES, get_message, list_messages, set_message
+from services.payment_method_service import list_payment_methods, toggle_payment_method
 from services.payment_service import approve_payment, reject_payment
+from services.wallet_service import change_wallet_balance
 from utils.auth import admin_guard
 
 router = Router()
-
-
-class AdminState(StatesGroup):
-    add_config_category = State()
-    add_config_text = State()
-    broadcast = State()
-
-    add_plan_name = State()
-    add_plan_price = State()
-
-    edit_plan_name = State()
-    edit_plan_price = State()
-
-    price_change = State()
-
-    card_number = State()
-    card_holder = State()
-
-    add_channel = State()
-    delete_channel = State()
-
-    add_admin = State()
-    delete_admin = State()
 
 
 async def _is_admin_user(call: CallbackQuery, session: AsyncSession, settings: Settings) -> bool:
@@ -81,7 +71,8 @@ async def approve_cb(call: CallbackQuery, session: AsyncSession):
     if ok and payment:
         order = await session.get(Order, payment.order_id)
         user = await session.scalar(select(User).where(User.id == order.user_id_fk))
-        await call.bot.send_message(user.user_id, f"✅ پرداخت شما تایید شد.\nکانفیگ شما:\n\n{msg}")
+        purchase_text = await get_message(session, "post_purchase_text")
+        await call.bot.send_message(user.user_id, purchase_text.format(config=msg))
         await call.message.answer("پرداخت تایید شد و کانفیگ ارسال گردید.")
     else:
         await call.message.answer(msg)
@@ -140,6 +131,149 @@ async def pending_payments(message: Message, session: AsyncSession, settings: Se
         await message.answer("پرداخت در انتظاری وجود ندارد.")
         return
     await message.answer(f"تعداد {len(rows)} پرداخت در انتظار تایید است. رسیدها در چت ادمین ارسال شده‌اند.")
+
+
+@router.message(F.text == "🗂 مدیریت موجودی")
+async def inventory_manage_start(message: Message, session: AsyncSession, settings: Settings):
+    if not await admin_guard(message, session, settings.admin_ids):
+        return
+    await message.answer("مدیریت موجودی:", reply_markup=inventory_manage_kb())
+
+
+@router.callback_query(F.data == "inv:stats")
+async def inventory_manage_stats(call: CallbackQuery, session: AsyncSession, settings: Settings):
+    if not await _is_admin_user(call, session, settings):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    rows = await category_with_counts(session)
+    if not rows:
+        await call.message.answer("هیچ دسته بندی ثبت نشده است.")
+    else:
+        lines = [f"{name}: {count} کانفیگ" for _, name, _, count in rows]
+        await call.message.answer("📦 موجودی فعلی:\n\n" + "\n".join(lines))
+    await call.answer()
+
+
+@router.callback_query(F.data == "inv:clear_cat")
+async def inventory_clear_category_start(call: CallbackQuery, session: AsyncSession, settings: Settings):
+    if not await _is_admin_user(call, session, settings):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    rows = (await session.execute(select(Category.id, Category.name).order_by(Category.id))).all()
+    if not rows:
+        await call.message.answer("هیچ دسته بندی ثبت نشده است.")
+    else:
+        await call.message.answer(
+            "دسته بندی موردنظر برای پاکسازی را انتخاب کنید:",
+            reply_markup=category_select_kb(rows, "invclr"),
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.regexp(r"^invclr:\d+$"))
+async def inventory_clear_category_confirm(call: CallbackQuery, session: AsyncSession, settings: Settings):
+    if not await _is_admin_user(call, session, settings):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    category_id = int(call.data.split(":")[1])
+    await call.message.answer(
+        "آیا از پاکسازی این دسته بندی مطمئن هستید؟",
+        reply_markup=confirm_delete_kb("invclr", category_id),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("invclr:yes:"))
+async def inventory_clear_category_apply(call: CallbackQuery, session: AsyncSession, settings: Settings):
+    if not await _is_admin_user(call, session, settings):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    category_id = int(call.data.split(":")[2])
+    deleted = await clear_inventory_by_category(session, category_id)
+    await call.message.answer(f"تعداد {deleted} کانفیگ از این دسته بندی حذف شد ✅")
+    await call.answer()
+
+
+@router.callback_query(F.data == "inv:clear_all")
+async def inventory_clear_all_confirm(call: CallbackQuery, session: AsyncSession, settings: Settings):
+    if not await _is_admin_user(call, session, settings):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    await call.message.answer(
+        "آیا مطمئن هستید؟ این عملیات تمام کانفیگ های موجود مخزن را حذف می کند.",
+        reply_markup=confirm_clear_all_kb(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "invall:yes")
+async def inventory_clear_all_apply(call: CallbackQuery, session: AsyncSession, settings: Settings):
+    if not await _is_admin_user(call, session, settings):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    deleted = await clear_inventory_all(session)
+    await call.message.answer(f"پاکسازی کامل انجام شد. تعداد {deleted} کانفیگ حذف شد ✅")
+    await call.answer()
+
+
+@router.callback_query(F.data.in_({"invall:no", "invclr:no"}))
+async def inventory_clear_cancel(call: CallbackQuery):
+    await call.message.answer("عملیات پاکسازی لغو شد.")
+    await call.answer()
+
+
+@router.message(F.text == "📝 مدیریت پیام‌ها")
+async def messages_manage_start(message: Message, session: AsyncSession, settings: Settings):
+    if not await admin_guard(message, session, settings.admin_ids):
+        return
+    await message.answer("مدیریت پیام های ربات:", reply_markup=messages_manage_kb())
+
+
+@router.callback_query(F.data == "msg:list")
+async def messages_list(call: CallbackQuery, session: AsyncSession, settings: Settings):
+    if not await _is_admin_user(call, session, settings):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    rows = await list_messages(session)
+    text = "📋 لیست پیام های قابل ویرایش:\n\n" + "\n\n".join(
+        [f"کلید: {key}\nمتن: {value[:200]}" for key, value in rows]
+    )
+    await call.message.answer(text)
+    await call.answer()
+
+
+@router.callback_query(F.data == "msg:edit")
+async def messages_edit_start(call: CallbackQuery, session: AsyncSession, settings: Settings):
+    if not await _is_admin_user(call, session, settings):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    keys = list(DEFAULT_MESSAGES.keys())
+    await call.message.answer(
+        "کلید پیام موردنظر را انتخاب کنید:",
+        reply_markup=category_select_kb([(idx + 1, key) for idx, key in enumerate(keys)], "msgkey"),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.regexp(r"^msgkey:\d+$"))
+async def messages_edit_pick(call: CallbackQuery, state: FSMContext, session: AsyncSession, settings: Settings):
+    if not await _is_admin_user(call, session, settings):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    idx = int(call.data.split(":")[1]) - 1
+    keys = list(DEFAULT_MESSAGES.keys())
+    if idx < 0 or idx >= len(keys):
+        return await call.answer("کلید نامعتبر است", show_alert=True)
+    key = keys[idx]
+    current = await get_message(session, key)
+    await state.update_data(edit_message_key=key)
+    await state.set_state(AdminState.edit_message_text)
+    await call.message.answer(f"متن فعلی برای {key}:\n\n{current}\n\nمتن جدید را ارسال کنید:")
+    await call.answer()
+
+
+@router.message(AdminState.edit_message_text)
+async def messages_edit_submit(message: Message, session: AsyncSession, state: FSMContext):
+    data = await state.get_data()
+    key = data.get("edit_message_key")
+    if not key:
+        await message.answer("کلید پیام مشخص نیست.")
+        await state.clear()
+        return
+    await set_message(session, key, (message.text or "").strip())
+    await message.answer("پیام با موفقیت ذخیره شد ✅")
+    await state.clear()
 
 
 @router.message(F.text == "⚙️ مدیریت کانفیگ‌ها")
@@ -552,6 +686,87 @@ async def send_broadcast(message: Message, session: AsyncSession, state: FSMCont
             pass
     await state.clear()
     await message.answer(f"ارسال همگانی انجام شد. تعداد موفق: {sent}")
+
+
+@router.message(F.text == "💸 مدیریت روش‌های پرداخت")
+async def payment_methods_manage(message: Message, session: AsyncSession, settings: Settings):
+    if not await admin_guard(message, session, settings.admin_ids):
+        return
+    rows = await list_payment_methods(session)
+    pairs = [(r.name, r.is_active) for r in rows]
+    await message.answer("وضعیت روش های پرداخت:", reply_markup=payment_methods_manage_kb(pairs))
+
+
+@router.callback_query(F.data.startswith("pm:toggle:"))
+async def payment_method_toggle_cb(call: CallbackQuery, session: AsyncSession, settings: Settings):
+    if not await _is_admin_user(call, session, settings):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    name = call.data.split(":")[2]
+    _, msg = await toggle_payment_method(session, name)
+    rows = await list_payment_methods(session)
+    await call.message.answer(msg, reply_markup=payment_methods_manage_kb([(r.name, r.is_active) for r in rows]))
+    await call.answer()
+
+
+@router.message(F.text == "🧾 تراکنش‌ها")
+async def transactions_list(message: Message, session: AsyncSession, settings: Settings):
+    if not await admin_guard(message, session, settings.admin_ids):
+        return
+    rows = (await session.execute(select(Transaction).order_by(Transaction.id.desc()).limit(30))).scalars().all()
+    if not rows:
+        await message.answer("تراکنشی ثبت نشده است.")
+        return
+    text = "آخرین تراکنش ها:\n\n" + "\n".join(
+        [f"#{t.id} | {t.user_id} | {t.amount:,} | {t.method} | {t.status} | {t.created_at}" for t in rows]
+    )
+    await message.answer(text)
+
+
+@router.message(F.text == "💼 کیف پول کاربران")
+async def wallets_admin(message: Message, session: AsyncSession, settings: Settings, state: FSMContext):
+    if not await admin_guard(message, session, settings.admin_ids):
+        return
+    await state.set_state(AdminState.wallet_adjust)
+    await message.answer(
+        "برای تغییر موجودی کیف پول، این فرمت را بفرستید:\nuser_id | +10000\nیا\nuser_id | -5000"
+    )
+
+
+@router.message(AdminState.wallet_adjust)
+async def wallet_adjust_submit(message: Message, session: AsyncSession, state: FSMContext):
+    try:
+        user_id_raw, delta_raw = [x.strip() for x in (message.text or "").split("|", 1)]
+        user_id = int(user_id_raw)
+        delta = int(delta_raw.replace("+", ""))
+    except Exception:
+        await message.answer("فرمت نامعتبر است.")
+        return
+    ok, msg, bal = await change_wallet_balance(session, user_id, delta, reason_method="admin_adjust", status="approved")
+    if not ok:
+        await message.answer(msg)
+        return
+    await message.answer(f"انجام شد ✅\nموجودی جدید: {bal:,} تومان")
+    await state.clear()
+
+
+@router.message(F.text == "👥 آمار زیرمجموعه‌ها")
+async def referrals_admin(message: Message, session: AsyncSession, settings: Settings):
+    if not await admin_guard(message, session, settings.admin_ids):
+        return
+    rows = (
+        await session.execute(
+            select(Referral.referrer_id, func.count(Referral.id))
+            .group_by(Referral.referrer_id)
+            .order_by(func.count(Referral.id).desc())
+            .limit(30)
+        )
+    ).all()
+    if not rows:
+        await message.answer("زیرمجموعه ای ثبت نشده است.")
+        return
+    await message.answer(
+        "آمار معرف ها:\n\n" + "\n".join([f"کاربر {uid}: {cnt} زیرمجموعه" for uid, cnt in rows])
+    )
 
 
 @router.message(AdminState.add_config_category)

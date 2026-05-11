@@ -13,6 +13,8 @@ from handlers.admin.panel import router as admin_router
 from handlers.user.start import router as user_router
 from services.admin_service import get_or_create_settings
 from services.config_service import seed_default_categories
+from services.nowpayments_webhook import start_nowpayments_webhook_server
+from services.payment_method_service import ensure_payment_methods
 from utils.middlewares import DbSessionMiddleware, SettingsMiddleware
 from utils.rate_limit import RateLimitMiddleware
 
@@ -23,6 +25,7 @@ async def on_startup():
     async with database.SessionLocal() as session:
         await seed_default_categories(session)
         await get_or_create_settings(session)
+        await ensure_payment_methods(session)
 
 
 async def main():
@@ -42,7 +45,15 @@ async def main():
     dp.include_router(user_router)
     dp.include_router(admin_router)
 
-    await dp.start_polling(bot)
+    webhook_runner = None
+    if settings.nowpayments_webhook_port > 0:
+        webhook_runner = await start_nowpayments_webhook_server(settings)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if webhook_runner:
+            await webhook_runner.cleanup()
 
 
 if __name__ == "__main__":
